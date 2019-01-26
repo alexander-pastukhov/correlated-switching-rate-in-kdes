@@ -1,0 +1,694 @@
+---
+title: "Perceptal switching rate between observers for KDE and NC displays"
+author: "Alexander (Sasha) Pastukhov"
+output:
+  github_document: default 
+  pdf_document: default
+  html_document: default
+---
+
+This is a complete analysis that generates all figures and statistics for the manuscript.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+
+library("BayesFactor")
+library("boot")
+library("dplyr")
+library("forcats")
+library("fs")
+library("ggplot2")
+library("ggpubr")
+library("knitr")
+library("lmPerm")
+library("moments")
+library("psycho")
+library("readr")
+library("stringr")
+library("tibble")
+library("tidyr")
+```
+
+## Presets
+
+
+```{r}
+rm(list= ls())
+
+bootstrapN <- 2000
+excluded_participant <- "BOF1999w"
+unclear_must_be_below <- 25
+```
+
+Please note that we exclude participant `r excluded_participant` from modelling, as she had no reports for *slow-down* condition.
+
+## Import and preprocessing
+
+Merging all CSV-files into a single table and computing duration of the invidiual dominance phases. Variables in the log files are:
+
+* **Session**  session timestamp in the form of _year-month-day-hour-minute-second_.
+* **Participant** Unique participant ID.
+* **Block** Block index.
+* **Condition** Block condition, can be either _Passive_, _Speed-up_, or _Slow-down_.
+* **Display** Block display, can be either _KDE -45_ (clockwise rotated kinetic-depth effect), _KDE 45_ (counterclockwise rotated kinetic-depth effect), or _NC_ (Necker cube lattice).
+* **OnsetDelay** Randomized delay before the stimulus onset in seconds.
+* **Percept** Perceptual reports (_left_, _right_, or _unclear_) or the _end of the block_ message.
+* **Time** Time of the perceptual report or of the end of the block relative to the block start, in seconds.
+
+
+```{r Import data}
+raw_results <- tibble(filename= dir_ls(path= "Data", type= "file", glob= "*.csv")) %>%
+    rowwise() %>%
+    do(read_csv2(.$filename, locale = locale(decimal_mark = ","),
+                 col_types = cols(Session = col_character(),
+                      Participant = col_character(),
+                      Block = col_integer(),
+                      Condition = col_character(),
+                      Display = col_character(),
+                      OnsetDelay = col_number(),
+                      Percept = col_character(),
+                      Time = col_number()
+                    ))) %>%
+    ungroup() %>%
+
+    # computing duration
+    group_by(Participant, Block) %>%
+    mutate(Duration= lead(Time) - Time) %>%
+    ungroup() %>%
+  
+    # excluding participant from the analysis
+    filter(Participant != excluded_participant)
+```
+
+Marking out "return transitions" (`ReturnTransition`) when same percepts dominates after the unclear period.
+
+```{r Return transitions}
+raw_results <- raw_results %>%
+    group_by(Participant, Block) %>%
+    mutate(ReturnTransition= ifelse(Percept == "unclear" & 
+                                    lag(Percept)!="unclear" & 
+                                    lead(Percept)!= "unclear" & 
+                                    lag(Percept) == lead(Percept), TRUE, FALSE), 
+           ReturnTransition= ifelse(Percept != "unclear", NA, ReturnTransition))
+```
+
+If a return transition is shorter than the geometric mean of the response time for the first percept for that particular stimulus, we exclude it and merge two succesive percepts into a single longer percept.
+
+```{r Merging percepts}
+# computing geometric mean RT for each participant and display
+avgRT <- raw_results %>%
+    group_by(Participant, Display, Block) %>%
+    summarise(firstRT= Time[1]) %>%
+    group_by(Participant, Display) %>%
+    summarise(geoMeanRT= exp(mean(log(firstRT))))
+
+# marking out return transition that are too short 
+raw_results <- raw_results %>%
+    right_join(avgRT, by= c("Participant", "Display")) %>%
+    mutate(MergePercept= ReturnTransition & Duration < geoMeanRT, 
+           MergePercept= ifelse(is.na(MergePercept), FALSE, MergePercept)) %>%
+    dplyr::select(-geoMeanRT)
+
+raw_results <- raw_results %>%
+    group_by(Participant, Display) %>%
+    mutate(iPercept= 1:n())
+
+
+# recomputing duration of the leading percept (merging two percepts together), 
+# while dropping return transitions and second percept
+results <- NULL
+iRawRow <- 1
+while (iRawRow <= nrow(raw_results)){
+    if ((iRawRow < nrow(raw_results)) & (raw_results$MergePercept[iRawRow+1])){
+        # next raw is marked return transition between two percepts to be merged
+        leading_percept <- raw_results[iRawRow, ]
+        while (raw_results$MergePercept[iRawRow+1]){
+            iRawRow <- iRawRow + 2
+            leading_percept$Duration <- raw_results$Time[iRawRow + 1] - leading_percept$Time
+        }
+        results <- rbind(results, leading_percept)
+        iRawRow <- iRawRow + 1
+    }
+    else{
+        # normal row, just copy it over
+        results <- bind_rows(results, raw_results[iRawRow, ])
+        iRawRow <- iRawRow + 1
+    }
+}
+```
+
+### Blocks with no reports
+```{r}
+percepts_per_block <- 
+  results %>%
+  group_by(Participant, Block) %>%
+  summarise(count= n()-1)
+
+no_reports <- 100 * sum(percepts_per_block$count == 0) / nrow(percepts_per_block)
+```
+
+Blocks with no reports: `r no_reports`%.
+
+
+### Unclear perception
+
+```{r}
+unclear_per_block <-
+  results %>%
+  filter(Percept != "end of the block")  %>%
+  
+  group_by(Participant, Display, Block) %>%
+  summarise(Punclear= 100.0 * sum(Duration[Percept == "unclear"], na.rm = TRUE) / sum(Duration, na.rm = TRUE))
+
+blocks_above_unclear_limit <- round(100 * sum(unclear_per_block$Punclear >= unclear_must_be_below) / nrow(unclear_per_block), 1)
+```
+
+There were `r blocks_above_unclear_limit` blocks with unclear perception taking up more than `r unclear_must_be_below`% of the total trial duration. 
+
+Average proportion of unclear perception for **unfiltered** data. 
+```{r}
+unclear_per_block %>%
+  group_by(Participant) %>%
+  summarise(`Punclear [%]`= mean(Punclear)) %>%
+  mutate(Participant = as.factor(Participant), 
+         Participant = fct_reorder(Participant, `Punclear [%]`)) %>%
+  ggplot(aes(x=Participant, y= `Punclear [%]`)) + 
+  geom_point() + 
+  geom_hline(yintercept =  unclear_must_be_below) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+
+Average proportion of unclear perception if block with more than 25% of unclear perception are excluded. 
+```{r}
+unclear_per_block %>%
+  filter(Punclear < unclear_must_be_below) %>%
+  group_by(Participant) %>%
+  summarise(`Punclear [%]`= mean(Punclear)) %>%
+  mutate(Participant = as.factor(Participant), 
+         Participant = fct_reorder(Participant, `Punclear [%]`)) %>%
+  ggplot(aes(x=Participant, y= `Punclear [%]`)) + 
+  geom_point() + 
+  geom_hline(yintercept =  unclear_must_be_below) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+```
+
+Only retaining block with unclear perception below `r unclear_must_be_below`%.
+
+```{r}
+results <- 
+  results %>%
+  filter(Percept != "end of the block")  %>%
+  
+  group_by(Participant, Display, Block) %>%
+  mutate(Punclear= 100.0 * sum(Duration[Percept == "unclear"], na.rm = TRUE) / sum(Duration, na.rm = TRUE)) %>%
+  
+  filter(Punclear < unclear_must_be_below) %>%
+  select(-Punclear)
+```
+
+### Extracting clear percepts for further analysis.
+
+```{r Extract clear percepts}
+clear_percepts <- results %>%
+  # filtering out "end of block" percepts
+  filter(Percept != "end of the block")  %>%
+  
+  # removing last percept, as its duration was curtailed by the end of the block
+  group_by(Session, Participant, Block) %>%
+  mutate(iPercept= 1:n()) %>%
+  arrange(Participant, Block, iPercept) %>%
+  slice(1:(n()-1)) %>%
+  arrange(Participant, Block) %>%
+  
+  # filtering out "unclear" percepts
+  filter(Percept %in% c("left", "right")) %>%
+  arrange(Participant, Block) %>%
+
+  dplyr::select(-ReturnTransition, -MergePercept) %>%
+  
+  # whether speed-up condition came first
+  group_by(Participant) %>%
+  mutate(SpeedUp_first= min(Block[Condition=="Speed-up"]) < min(Block[Condition=="Slow-down"])) %>%
+  ungroup()
+```
+
+## Basic demographics
+
+```{r}
+participants <- 
+  results %>% 
+  group_by(Participant) %>%
+  summarise() %>%
+  mutate(gender= str_to_lower(str_sub(Participant, start= -1)), 
+         year= as.integer(str_sub(Participant, start= 4, end= -2)))
+```
+
+Gender:
+```{r}
+participants %>%
+  count(gender) %>%
+  mutate(gender= fct_recode(gender, male= "m", female= "w")) %>%
+  kable()
+```
+
+Age:
+```{r}
+participants %>%
+  mutate(age= 2018-year) %>%
+  summarise(youngest= min(age), 
+            oldest= max(age)) %>%
+  kable()
+```
+
+
+
+
+## Utilities
+
+Routine that plots displays pairwise against each other and also reports related specs. It ensure that all plots and statistics look consistent across observables.
+
+```{r corrplot routine}
+corrplot <- function(table, R= 2000, log_scale = TRUE){
+  all_plots <- list()
+  all_stats <- tibble()
+  for(iFirst in 1:(length(unique(table$Display))-1)){
+    for(iSecond in (iFirst + 1):length(unique(table$Display))){
+      displays <- unique(table$Display)[c(iFirst, iSecond)]
+      # subset with only two displays
+      narrow_subset <- 
+        table %>% 
+        filter(Display %in% displays) %>%
+        mutate(Display= as.factor(Display), 
+               Display= fct_recode(Display, V1= displays[1], V2= displays[2]))
+      
+      wide_subset <- 
+        narrow_subset %>%
+        spread(key= Display, -Participant)
+      
+      # common limits for both x and y axis, so we can make a square plot
+      limits <- narrow_subset %>% dplyr::select(-Display, -Participant) %>% summarise_all(c("min", "max"))
+      min_limit <- limits$min[1] * 0.95
+      max_limit <- limits$max[1] * 1.05
+
+      # scatter plot with individual participants labeled by color
+      all_plots[[length(all_plots)+1]] <-
+          ggplot(data= wide_subset, aes(x= V1, y= V2)) + 
+            geom_abline(slope = 1, color= "white") + 
+            geom_point(aes(color= Participant)) + 
+            geom_smooth(method= "lm", se = FALSE, color= "black") + 
+            theme(legend.position = "none") + 
+            xlab(displays[1]) + 
+            ylab(displays[2]) +
+            coord_equal()
+      
+      if (log_scale) {
+        all_plots[[length(all_plots)]] <-
+          all_plots[[length(all_plots)]] + 
+            scale_x_log10(limits= c(min_limit, max_limit)) + 
+            scale_y_log10(limits= c(min_limit, max_limit))
+      } 
+      else {
+          all_plots[[length(all_plots)]] + 
+            scale_x_continuous(limits= c(min_limit, max_limit)) + 
+            scale_y_continuous(limits= c(min_limit, max_limit))
+      }
+
+      # frequentist correlation
+      pearsonR <- cor.test(~ V2 + V1, data= wide_subset, method = "pearson")
+      correlationR <- function(data, index, method){
+        pR <-   suppressWarnings( cor.test(~ V2 + V1, data= data[index, ], 
+                                           method = method))
+        pR$estimate
+      }
+      boot_values <- boot(wide_subset, correlationR, R= R, method= "pearson")
+      CIs <- boot.ci(boot_values, type = "bca")
+      pearsonCI <- CIs$bca[4:5]
+      
+      # bayesian correlation
+      bayesR <- bayes_cor.test(wide_subset$V1, wide_subset$V2, CI = 95)
+
+
+      # plotting bootstrapped frequentist correlation and bayesian posterior distribution as histograms
+      boot_corr <- rbind(data.frame(R= boot_values$t, method= "frequentist"), 
+                         data.frame(R= bayesR$values$posterior, method= "bayesian"))
+      all_plots[[length(all_plots)+1]] <-
+        ggplot(boot_corr, aes(x= R, fill= method, group= method)) +
+        geom_histogram(aes(y=0.5*..density..), binwidth=0.025, position= 'identity', alpha= 0.5) + 
+        ylab('Density') + 
+        scale_x_continuous(limits = c(-1, 1), 
+                           breaks = round(c(-1, 0, 1, unname(pearsonR$estimate),  pearsonCI, bayesR$values$median, bayesR$values$CI_values), digits= 2)) +
+        theme(legend.position = "none")
+        
+      # all stats in a single table
+      all_stats <- rbind(all_stats, 
+                         tibble(Display1= displays[1],
+                                Display2= displays[2], 
+                                R= pearsonR$estimate, 
+                                frequentistL= pearsonCI[1], 
+                                frequentistU= pearsonCI[2],
+                                frequentistP= pearsonR$p.value, 
+                                frequentistGT0= round(100*mean(boot_values$t>0), 1),
+                                bayesianR= bayesR$values$median,
+                                bayesianL= bayesR$values$CI_values[1],
+                                bayesianU= bayesR$values$CI_values[2], 
+                                bayesianBF= bayesR$values$bf, 
+                                bayesianGT0= round(100 * mean(bayesR$values$posterior>0), 1)))
+    }
+  }
+  
+  single_plot <- ggarrange(plotlist = all_plots, 
+          widths = c(1, 1), 
+          ncol= 2, nrow= 3, 
+          labels= intToUtf8(utf8ToInt("A") + c(0:5), multiple = TRUE))
+  
+  list(single_plot= single_plot, plots= all_plots, stats= all_stats)
+}
+```
+
+## Comparing switching rate between displays conditions for passive viewing
+
+Computing summary statistics for clear percepts
+```{r}
+averages <- clear_percepts %>%
+    group_by(Participant, Condition, Display) %>%
+    summarise(Tmean= mean(Duration), 
+              Tmedian= median(Duration), 
+              Tgeomean= exp(mean(log(Duration))), 
+              Cv= sd(Duration)/mean(Duration), 
+              speedUp_First= SpeedUp_first[1])
+```
+
+
+### Passive viewing: Tmean 
+```{r passive viewing}
+set.seed(6385088)
+passive <- averages %>%
+    filter(Condition == "Passive") %>%
+    ungroup() %>%
+    dplyr::select(Participant, Display, Tmean)
+
+passive_results <- corrplot(passive, R= bootstrapN)
+annotate_figure(passive_results[["single_plot"]], 
+  top= text_grob("Passive viewing, <Tmean>"))
+
+ggsave("passive-tmean.pdf", passive_results[["single_plot"]], 
+       units= "cm", width = 14, height= 20)
+
+passive_results[["stats"]] %>%
+  knitr::kable()
+```
+
+### Passive viewing: geometric mean
+This generates **Figure 2**. 
+
+```{r passive viewing geomean}
+set.seed(83148031)
+passive <- averages %>%
+    filter(Condition == "Passive") %>%
+    ungroup() %>%
+    dplyr::select(Participant, Display, Tgeomean)
+
+passive_results <- corrplot(passive, R= bootstrapN)
+annotate_figure(passive_results[["single_plot"]], 
+  top= text_grob("Passive viewing, <Tgeomean>"))
+
+ggsave("passive-tgeomean.pdf", passive_results[["single_plot"]], 
+       units= "cm", width = 14, height= 20)
+
+passive_results[["stats"]] %>%
+  knitr::kable()
+```
+
+### Cv during passive viewing
+```{r Cv}
+set.seed(7652564)
+passive_cv <- averages %>%
+    filter(Condition == "Passive") %>%
+    ungroup() %>%
+    dplyr::select(Participant, Display, Cv)
+
+
+
+cv_results <- corrplot(passive_cv, R= bootstrapN)
+annotate_figure(cv_results[["single_plot"]], 
+  top= text_grob("Passive vieweing, <Cv>"))
+
+ggsave("passive-tmean.pdf", cv_results[["single_plot"]], 
+       units= "cm", width = 14, height= 20)
+
+cv_results[["stats"]] %>%
+  knitr::kable()
+```
+
+## Comparing dominance time distributions for two displays are identical for each participant 
+
+### Utility functions
+
+Please note that function "perm.t.test" is a copied from package _Deducer_ rather than used directly from package. The reason for that is a large overhead (Java, interactive window, etc.) associated with loading the package's namescape. Otherwise, the function code is identical to that of the package, as of 25/01/2019 ([source at github](https://github.com/cran/Deducer/blob/master/R/perm.t.test.R)).
+
+```{r}
+perm.t.test<-function(x,y,statistic=c("t","mean"),
+			alternative=c("two.sided", "less", "greater"), midp=TRUE, B=10000){
+	DNAME <- paste(deparse(substitute(x)), "and", deparse(substitute(y)))
+	x<-na.omit(x)
+	y<-na.omit(y)
+	nx<-length(x)
+	ny<-length(y)
+	alternative<-match.arg(alternative)
+	statistic<-match.arg(statistic)
+	mult<- if(midp) .5 else 1
+	var1<-var#function(s){.Internal(cov(s, NULL, TRUE, FALSE))}
+	sum1<-.Primitive("sum")
+	dat<-c(x,y)	
+	if(statistic=="mean"){
+		METHOD<-paste("Two-Sample permutation test using mean difference (B=", B,")")
+		stat<-sum(y)
+		nmin<-ny
+		samp<-replicate(B,sum(sample(dat,nmin)))
+		STAT<-mean(x)-mean(y)
+		names(STAT)<-"Mean Difference"
+	}else{
+		METHOD<-paste("Two-Sample permutation test using Welsh's t (B=",B,")")
+		stat<-(mean(x)- mean(y))/sqrt(var1(x)/nx+var1(y)/ny)
+		samp<-replicate(B,sample(dat,nx+ny))
+		sx<-apply(samp[1:nx,],2,function(s) c(sum1(s),var1(s)))
+		sy<-apply(samp[(nx+1):(nx+ny),],2,function(s) c(sum1(s),var1(s)))
+		samp<-(sx[1,]/nx-sy[1,]/ny)/sqrt(sx[2,]/nx+sy[2,]/ny)
+		STAT<-stat
+		names(STAT)<-"Welsh t-statistic"
+	}
+	lower<-sum(samp<stat)/(B+1)
+	upper<-sum(samp>stat)/(B+1)
+	equal<-sum(samp==stat)/(B+1)
+	if(alternative=="two.sided")
+		p.value<-2*min(lower,upper)+2*mult*equal
+	else if(alternative=="less")
+		p.value<-lower+mult*equal
+	else
+		p.value<-upper+mult*equal
+	p.value<-min(p.value,1)
+	RVAL<-list(statistic=STAT,p.value=p.value,method=METHOD,data.name=DNAME,
+				alternative=alternative,B=B)
+	class(RVAL)<-"htest"
+	return(RVAL)
+}
+```
+
+```{r in-between utils}
+dist_ttest <- function(data){
+  displays <- unique(data$Display)
+  
+  ttest_results <- perm.t.test(data$logDuration[data$Display == displays[1]], 
+                               data$logDuration[data$Display == displays[2]])
+  
+  bayes_results <- extractBF(ttestBF(data$logDuration[data$Display == displays[1]], 
+                                     data$logDuration[data$Display == displays[2]])) 
+  tibble(BF= bayes_results$bf, 
+         `Welsh t-statistic` = ttest_results$statistic, 
+         p.value = ttest_results$p.value)
+}
+
+
+compare_logtimes <- function(data, displays){
+  data %>%
+    filter(Display %in% displays, Participant != excluded_participant) %>%
+    
+    # logtransforming durations
+    mutate(logDuration= log(Duration)) %>%
+
+    # computing t-test per observer
+    group_by(Participant) %>%
+    do(dist_ttest(.)) %>%
+    
+    # adjusting p-values for multiple comparisons
+    mutate(p.adj= p.adjust(p.value)) %>%
+    ungroup() %>%
+    mutate(p.adj= p.adjust(p.value)) %>%
+    arrange(p.adj)
+}
+```
+
+### Comparing two KDEs
+```{r in-between KDE}
+set.seed(9703620)
+kdes <- compare_logtimes(clear_percepts, c("KDE 45",  "KDE -45"))
+
+p_above_05 <- sum(kdes$p.adj < 0.05)
+p_above_10 <- sum(kdes$p.adj < 0.10)
+bf_above_3 <- sum(kdes$BF > 3)
+total_n <- nrow(kdes)
+
+kdes %>%
+  knitr::kable()
+```
+
+Adjusted p-values below .05: `r p_above_05` out of `r total_n`.
+
+Adjusted p-values below .1: `r p_above_10` out of `r total_n`.
+
+Bayes factor above 3: `r bf_above_3` out of `r total_n`.
+
+### KDE CW versus NC
+```{r in-between KDE45-NC}
+set.seed(1248764)
+kde45_nc <- compare_logtimes(clear_percepts, c("KDE 45",  "NC"))
+
+p_above_05 <- sum(kde45_nc$p.adj < 0.05)
+p_above_10 <- sum(kde45_nc$p.adj < 0.10)
+bf_above_3 <- sum(kde45_nc$BF > 3)
+total_n <- nrow(kde45_nc)
+
+kde45_nc %>%
+  knitr::kable()
+```
+
+Adjusted p-values below .05: `r p_above_05` out of `r total_n`.
+
+Adjusted p-values below .1: `r p_above_10` out of `r total_n`.
+
+Bayes factor above 3: `r bf_above_3` out of `r total_n`.
+
+### KDE CCW versus NC
+```{r in-between KDEm45-NC}
+set.seed(8371171)
+kdem45_nc <- compare_logtimes(clear_percepts, c("KDE -45",  "NC"))
+
+p_above_05 <- sum(kdem45_nc$p.adj < 0.05)
+p_above_10 <- sum(kdem45_nc$p.adj < 0.10)
+bf_above_3 <- sum(kdem45_nc$BF > 3)
+total_n <- nrow(kdem45_nc)
+
+kdem45_nc %>%
+  knitr::kable()
+```
+
+## Volitional control
+
+### Overall speed-up and slow-down
+
+This generates **Figure 3** and **Table 1**.
+
+```{r}
+set.seed(25212095)
+volition <- 
+  averages %>%
+  ungroup() %>%
+  group_by(Participant, Display, speedUp_First) %>%
+  summarise(`Speed-Up`= Tgeomean[Condition=="Speed-up"]/Tgeomean[Condition == "Passive"], 
+            `Slow-Down`= Tgeomean[Condition=="Slow-down"]/Tgeomean[Condition == "Passive"]) %>%
+  gather(key= "Condition", value= "Ratio", -Participant, -Display, -speedUp_First) %>%
+  ungroup() %>%
+  mutate(Condition= as.factor(Condition)) %>%
+  mutate(Condition= fct_relevel(Condition, "Speed-Up")) %>%
+  
+  # reversing speedUp_First for Slow-Down condition
+  ungroup() %>%
+  mutate(speedUp_First= ifelse(Condition == "Slow-down", !speedUp_First, speedUp_First)) %>%
+  mutate(`Experiment Part`= ifelse(speedUp_First, '2', '3')) %>%
+  select(-speedUp_First) %>%
+  
+  # adding mean for each Display, Condition, and speedUp_First
+  group_by(Display, Condition, `Experiment Part`) %>%
+  mutate(MeanRatio= mean(Ratio))
+
+ggplot(data= volition, aes(x= Ratio, fill= `Experiment Part`)) + 
+  geom_histogram(aes(y=0.5*..density..), binwidth=0.25, position= 'identity', alpha= 0.5) + 
+  geom_vline(xintercept = 1) + 
+  geom_vline(aes(xintercept =  MeanRatio, color= `Experiment Part`), size= 1) +
+  scale_x_log10(name= "Change as ratio") + 
+  ylab("Density") + 
+  # theme(legend.position = 'none')+
+  facet_grid(Condition~Display, scales = "free_y")
+
+ggsave("change-ratio.pdf",
+       units= "cm", width = 14, height= 12)
+
+
+volition$Display <- as.factor(volition$Display)
+volition$`Experiment Part` <- as.factor(volition$`Experiment Part`)
+summary(aovp(Ratio ~ Display * `Experiment Part` * Condition, data= volition))
+
+sort(anovaBF(Ratio ~ Display + `Experiment Part` + Condition, data= volition), decreasing = TRUE)
+```
+
+
+### Speed up
+This generates **Figure 4**.
+
+```{r speed-up}
+set.seed(3710789)
+speedup <- averages %>%
+  ungroup() %>%
+  filter(Condition %in% c("Passive", "Speed-up")) %>%
+  group_by(Participant, Display) %>%
+  summarise(SpeedUpRatio= Tgeomean[Condition=="Speed-up"]/Tgeomean[Condition == "Passive"]) %>%
+  ungroup()
+
+
+speedup_results <- corrplot(speedup, R= bootstrapN)
+annotate_figure(speedup_results[["single_plot"]], 
+  top= text_grob("Speed-up ratio"))
+
+ggsave("speedup-ratio.pdf", speedup_results[["single_plot"]], 
+       units= "cm", width = 14, height= 20)
+
+speedup_results[["stats"]] %>%
+  knitr::kable()
+```
+
+### Slow down
+
+This generates **Figure 5**.
+
+```{r slow-down}
+set.seed(5666438)
+slowdown <- averages %>%
+  ungroup() %>%
+  filter(Condition %in% c("Passive",  "Slow-down")) %>%
+  
+  # excluding participant with incomplete set of blocks
+  group_by(Participant, Display) %>%
+  summarise(SlowDownRatio= Tgeomean[Condition=="Slow-down"]/Tgeomean[Condition == "Passive"]) %>%
+  ungroup()
+
+
+slowdown_results <- corrplot(slowdown, R= bootstrapN)
+annotate_figure(slowdown_results[["single_plot"]], 
+  top= text_grob("Slowing down"))
+
+ggsave("slowdown-ratio.pdf", slowdown_results[["single_plot"]], 
+       units= "cm", width = 14, height= 20)
+
+slowdown_results[["stats"]] %>%
+  knitr::kable()
+```
+
+
+
+Adjusted p-values below .05: `r p_above_05` out of `r total_n`.  
+
+Adjusted p-values below .1: `r p_above_10` out of `r total_n`.
+
+Bayes factor above 3: `r bf_above_3` out of `r total_n`.
+
