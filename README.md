@@ -2,7 +2,7 @@
 
 Data and analysis for the study on (un)correlated switching rate in KDE and NC displays.
 
-The full dataset is in **Data** folder. Supplementary videos is **Videos** folder. For Complete analysis please refer to [Analysis.Rmd](Analysis.Rmd) file or to static Github version of it [Analysis.md](Analysis.md).
+The full dataset is in **Data** folder. Supplementary videos are in **Videos** folder. For Complete analysis please refer to [Analysis.Rmd](Analysis.Rmd) file or to static Github version of it [Analysis.md](Analysis.md).
 
 ## CSV-format
 
