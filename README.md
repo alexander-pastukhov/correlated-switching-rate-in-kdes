@@ -1,6 +1,6 @@
 # Correlated switching rate in kinectic-depth effect displays
 
-Data and analysis for the study on switch rates in kinectic-depth effect and Necker cube displays.
+Data and analysis for the study on switch rates in kinetic-depth effect and Necker cube displays.
 
 The full dataset is in **Data** folder. Supplementary videos are in **Videos** folder. For complete analysis please refer to [Analysis.Rmd](Analysis.Rmd) file or to static Github version of it [Analysis.md](Analysis.md).
 
