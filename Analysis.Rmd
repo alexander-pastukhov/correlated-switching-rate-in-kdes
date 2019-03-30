@@ -624,14 +624,26 @@ ggplot(data= volition, aes(x= Ratio, fill= `Experiment Part`)) +
 ggsave("change-ratio.pdf",
        units= "cm", width = 14, height= 12)
 
+volition <-
+  volition %>%
+  ungroup() %>%
+  mutate(Display = as.factor(Display), 
+         `Experiment Part` = as.factor(`Experiment Part`), 
+         Modulation = ifelse(Condition =="Speed-Up", 1/MeanRatio, MeanRatio))
 
-volition$Display <- as.factor(volition$Display)
-volition$`Experiment Part` <- as.factor(volition$`Experiment Part`)
 summary(aovp(Ratio ~ Display * `Experiment Part` * Condition, data= volition))
 
 sort(anovaBF(Ratio ~ Display + `Experiment Part` + Condition, data= volition), decreasing = TRUE)
 ```
 
+Modulation strength for speed-up versus slow-down.
+
+```{r modulation speed-up versus slow-down}
+ggplot(data=volition, aes(x=Modulation, color=Condition, fill=Condition)) + 
+  geom_histogram()
+
+summary(lmerTest::lmer(Modulation ~ Condition + Display + (1|Participant), data = volition))
+```
 
 ### Speed up
 This generates **Figure 4**.
